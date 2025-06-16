@@ -281,3 +281,5 @@ class WeatherPlugin(BasePlugin):
         if code == 803: return "🌥️";
         if code == 804: return "☁️";
         return "❓"
+
+# сань соси
