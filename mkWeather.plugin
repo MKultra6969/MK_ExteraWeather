@@ -1,0 +1,283 @@
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from ui.settings import Header, Divider, Selector, Text, Input
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from android_utils import run_on_ui_thread, log
+from client_utils import get_last_fragment, run_on_queue, send_message, get_messages_controller
+from org.telegram.messenger import AndroidUtilities
+from android.content import Intent
+from android.net import Uri
+
+import json
+import traceback
+import urllib.request
+from urllib.parse import quote
+from urllib.error import HTTPError
+from typing import Optional
+
+# --- Метаданные плагина ---
+__name__ = "MKWeather"
+__description__ = "Показывает погоду для указанного города. Команда `.погода` без города определит местоположение по IP (GeoIP)."
+__icon__ = "weather"
+__version__ = "0.1.0"
+__id__ = "MKweather_plugin"
+__author__ = "@ffs_tmp_info"
+__min_version__ = "0.6.9"
+
+
+# --- Локализация ---
+class LocalizationManager:
+    def __init__(self):
+        self.language = "en"
+
+    def set_language(self, lang_code: str):
+        self.language = lang_code
+
+    def get_string(self, string_key, **kwargs):
+        string = self.strings.get(self.language, self.strings["en"]).get(string_key, string_key)
+        if kwargs: return string.format(**kwargs)
+        return string
+
+    strings = {"ru": {"SETTINGS_HEADER": "Настройки погоды", "UNITS": "Единицы измерения", "UNIT_CELSIUS": "Цельсий",
+                      "UNIT_FAHRENHEIT": "Фаренгейт", "LANGUAGE": "Язык", "LANG_EN": "Английский", "LANG_RU": "Русский",
+                      "API_KEY_HEADER": "API Ключ OpenWeatherMap", "API_KEY_INPUT_LABEL": "API Ключ",
+                      "API_KEY_INFO": "Для работы плагина нужен бесплатный API ключ. Получите его на openweathermap.org и установите здесь или командой .weatherkey <ключ>",
+                      "API_KEY_SET": "✅ API ключ успешно сохранен!", "API_KEY_EMPTY": "❌ Ключ не может быть пустым.",
+                      "FETCHING_WEATHER": "Получение погоды...",
+                      "FETCHING_GEOLOCATION": "Определение местоположения...",
+                      "ERR_GEOIP_FAILED": "🤷‍♂️ Не удалось определить город по IP.",
+                      "ERR_NO_CITY": "😕 Пожалуйста, укажите город. Например: .weather Москва",
+                      "ERR_NOT_FOUND": "🤷‍♂️ Город '{city}' не найден.",
+                      "ERR_NO_API_KEY": "🔑 API ключ не установлен. Подробнее в настройках плагина.",
+                      "ERR_API_INVALID": "🚫 Неверный или неактивный API ключ. Проверьте его.",
+                      "ERR_API_GENERIC": "📡 Ошибка API: {code} {reason}", "ERR_UNKNOWN": "Неизвестная ошибка: {error}",
+                      "MSG_WEATHER_IN": "Погода в", "MSG_TEMP": "Температура", "MSG_FEELS": "ощущается как",
+                      "MSG_HUMIDITY": "Влажность", "MSG_WIND": "Ветер", "m/s": "м/с", "mph": "миль/ч",
+                      "DONATE_HEADER": "Поддержать автора", "DONATE_TEXT": "Криптовалютой", "GITHUB": "GitHub автора",
+                      "COPIED_TO_CLIPBOARD": "Ссылка скопирована в буфер обмена"},
+               "en": {"SETTINGS_HEADER": "Weather Settings", "UNITS": "Units", "UNIT_CELSIUS": "Celsius",
+                      "UNIT_FAHRENHEIT": "Fahrenheit", "LANGUAGE": "Language", "LANG_EN": "English",
+                      "LANG_RU": "Russian", "API_KEY_HEADER": "OpenWeatherMap API Key",
+                      "API_KEY_INPUT_LABEL": "API Key",
+                      "API_KEY_INFO": "The plugin requires a free API key. Get it at openweathermap.org and set it here or with the command .weatherkey <key>",
+                      "API_KEY_SET": "✅ API key saved successfully!", "API_KEY_EMPTY": "❌ The key cannot be empty.",
+                      "FETCHING_WEATHER": "Fetching Weather...", "FETCHING_GEOLOCATION": "Determining location...",
+                      "ERR_GEOIP_FAILED": "🤷‍♂️ Could not determine city by IP.",
+                      "ERR_NO_CITY": "😕 Please specify a city. For example: .weather London",
+                      "ERR_NOT_FOUND": "🤷‍♂️ City '{city}' not found.",
+                      "ERR_NO_API_KEY": "🔑 API key is not set. See plugin settings for details.",
+                      "ERR_API_INVALID": "🚫 Invalid or inactive API key. Please check it.",
+                      "ERR_API_GENERIC": "📡 API Error: {code} {reason}", "ERR_UNKNOWN": "Unknown error: {error}",
+                      "MSG_WEATHER_IN": "Weather in", "MSG_TEMP": "Temperature", "MSG_FEELS": "feels like",
+                      "MSG_HUMIDITY": "Humidity", "MSG_WIND": "Wind", "m/s": "m/s", "mph": "mph",
+                      "DONATE_HEADER": "Support the Author", "DONATE_TEXT": "With Cryptocurrency",
+                      "GITHUB": "Author's GitHub", "COPIED_TO_CLIPBOARD": "Link copied to clipboard"}}
+
+
+locali = LocalizationManager()
+
+
+class WeatherPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.api_base_url = "https://api.openweathermap.org/data/2.5/weather"
+        self.geoip_url = "http://ip-api.com/json"
+        self.progress_dialog: Optional[AlertDialogBuilder] = None
+        self._update_localizer()
+
+    def _update_localizer(self):
+        lang_setting = self.get_setting("language", 0)
+        locali.set_language("ru" if lang_setting == 1 else "en")
+
+    def _copy_to_clipboard(self, text_to_copy: str):
+        if AndroidUtilities.addToClipboard(text_to_copy):
+            BulletinHelper.show_info(locali.get_string("COPIED_TO_CLIPBOARD"))
+
+    def _open_url(self, url: str):
+        def task():
+            try:
+                fragment = get_last_fragment()
+                if fragment and fragment.getParentActivity():
+                    activity = fragment.getParentActivity()
+                    uri = Uri.parse(url)
+                    intent = Intent(Intent.ACTION_VIEW, uri)
+                    activity.startActivity(intent)
+                else:
+                    log("WeatherPlugin: Could not open URL, no activity found.")
+            except Exception as e:
+                log(f"WeatherPlugin: Failed to open URL {url}. Error: {e}")
+
+        # Выполняем в UI потоке
+        run_on_ui_thread(task)
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook(priority=100)
+        self._update_localizer()
+
+    def create_settings(self):
+        self._update_localizer()
+        return [
+            Header(text=locali.get_string("SETTINGS_HEADER")),
+            Selector(key="units", text=locali.get_string("UNITS"),
+                     items=[locali.get_string("UNIT_CELSIUS"), locali.get_string("UNIT_FAHRENHEIT")], default=0,
+                     icon="msg_temperature"),
+            Selector(key="language", text=locali.get_string("LANGUAGE"),
+                     items=[locali.get_string("LANG_EN"), locali.get_string("LANG_RU")], default=0, icon="msg_language",
+                     on_change=lambda val: self._on_language_change(val)),
+            Divider(),
+            Header(text=locali.get_string("API_KEY_HEADER")),
+            Input(key="api_key", text=locali.get_string("API_KEY_INPUT_LABEL"), default=self.get_setting("api_key", ""),
+                  icon="msg_pin_code"),
+            Divider(text=locali.get_string("API_KEY_INFO")),
+            Header(text=locali.get_string("DONATE_HEADER")),
+            Text(text=locali.get_string("DONATE_TEXT"), icon="menu_cashtag", accent=True,
+                 on_click=lambda v: self._copy_to_clipboard("http://t.me/send?start=IV5BntjEdiMW")),
+            # Ссылка на GitHub теперь будет работать
+            Text(text=locali.get_string("GITHUB"), icon="msg_info", accent=True,
+                 on_click=lambda v: self._open_url("https://github.com/MKultra6969"))
+        ]
+
+    def _on_language_change(self, value):
+        self._update_localizer()
+        self.reload_settings_ui()
+
+    def on_send_message_hook(self, account, params):
+        text = params.message
+        if not text:
+            return HookResult()
+
+        text_lower = text.strip().lower()
+        self._update_localizer()
+
+        if text_lower.startswith(".weatherkey "):
+            key = text[len(".weatherkey "):].strip()
+            if key:
+                self.set_setting("api_key", key)
+                BulletinHelper.show_info(locali.get_string("API_KEY_SET"))
+            else:
+                BulletinHelper.show_error(locali.get_string("API_KEY_EMPTY"))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if text_lower.startswith(".weather") or text_lower.startswith(".погода"):
+            parts = text.strip().split(" ", 1)
+            city = parts[1].strip() if len(parts) > 1 else None
+            loading_message = locali.get_string("FETCHING_GEOLOCATION") if not city else locali.get_string(
+                "FETCHING_WEATHER")
+            run_on_ui_thread(lambda: self._show_loading_dialog(loading_message))
+            run_on_queue(lambda: self._fetch_weather(params.peer, city=city))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        return HookResult()
+
+    def _show_loading_dialog(self, title: str):
+        fragment = get_last_fragment()
+        if not fragment or not fragment.getParentActivity():
+            log("WeatherPlugin: Cannot get activity to show dialog.")
+            return
+
+        self.progress_dialog = AlertDialogBuilder(fragment.getParentActivity(), AlertDialogBuilder.ALERT_TYPE_SPINNER)
+        self.progress_dialog.set_title(title)
+        self.progress_dialog.set_cancelable(False)
+        self.progress_dialog.show()
+
+    def _dismiss_loading_dialog(self):
+        if self.progress_dialog:
+            self.progress_dialog.dismiss()
+            self.progress_dialog = None
+
+    def _fetch_city_by_ip(self) -> Optional[str]:
+        try:
+            with urllib.request.urlopen(self.geoip_url, timeout=5) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                if data.get("status") == "success" and data.get("city"):
+                    return data.get("city")
+                log(f"GeoIP API error: {data.get('message')}")
+                return None
+        except Exception:
+            log(f"GeoIP request failed: {traceback.format_exc()}")
+            return None
+
+    def _fetch_weather(self, peer_id: int, city: Optional[str] = None):
+        try:
+            if not city:
+                city = self._fetch_city_by_ip()
+                if not city:
+                    self._show_error_bulletin(locali.get_string("ERR_GEOIP_FAILED"))
+                    return
+
+            api_key = self.get_setting("api_key")
+            if not api_key:
+                self._show_error_bulletin(locali.get_string("ERR_NO_API_KEY"))
+                return
+
+            units_setting = self.get_setting("units", 0)
+            unit_param = "metric" if units_setting == 0 else "imperial"
+            lang_param = locali.language
+            url = f"{self.api_base_url}?q={quote(city)}&appid={api_key}&units={unit_param}&lang={lang_param}"
+
+            with urllib.request.urlopen(url, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                message = self._format_weather_message(data, units_setting)
+                self._send_response(message, peer_id)
+
+        except HTTPError as e:
+            if e.code == 404:
+                self._show_error_bulletin(locali.get_string("ERR_NOT_FOUND", city=city))
+            elif e.code == 401:
+                self._show_error_bulletin(locali.get_string("ERR_API_INVALID"))
+            else:
+                self._show_error_bulletin(locali.get_string("ERR_API_GENERIC", code=e.code, reason=e.reason))
+        except Exception:
+            log(f"Weather Plugin Error: {traceback.format_exc()}")
+            self._show_error_bulletin(locali.get_string("ERR_API_INVALID"))
+
+    def _send_response(self, text, peer_id):
+        def task():
+            self._dismiss_loading_dialog()
+            send_message({"peer": peer_id, "message": text})
+
+        run_on_ui_thread(task)
+
+    def _show_error_bulletin(self, text: str):
+        def task():
+            self._dismiss_loading_dialog()
+            BulletinHelper.show_error(text)
+
+        run_on_ui_thread(task)
+
+    def _format_weather_message(self, data, units_setting):
+        unit_symbol = "°C" if units_setting == 0 else "°F";
+        wind_unit = locali.get_string("m/s") if units_setting == 0 else locali.get_string("mph");
+        city_name = data.get('name', 'N/A');
+        country = data.get('sys', {}).get('country', '');
+        description = data.get('weather', [{}])[0].get('description', 'N/A').capitalize();
+        temp = data.get('main', {}).get('temp', 'N/A');
+        feels_like = data.get('main', {}).get('feels_like', 'N/A');
+        humidity = data.get('main', {}).get('humidity', 'N/A');
+        wind_speed = data.get('wind', {}).get('speed', 'N/A');
+        wind_deg = data.get('wind', {}).get('deg');
+        wind_dir = self._get_wind_direction(wind_deg);
+        icon = self._get_weather_icon(data.get('weather', [{}])[0].get('id'));
+        msg = f"{icon} {locali.get_string('MSG_WEATHER_IN')} {city_name}, {country}:\n• {description}\n• {locali.get_string('MSG_TEMP')}: {temp}{unit_symbol} ({locali.get_string('MSG_FEELS')}: {feels_like}{unit_symbol})\n• {locali.get_string('MSG_HUMIDITY')}: {humidity}%\n• {locali.get_string('MSG_WIND')}: {wind_speed} {wind_unit} ({wind_dir})";
+        return msg
+
+    def _get_wind_direction(self, deg):
+        if deg is None: return ""
+        dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+        ix = round(deg / (360. / len(dirs)));
+        return dirs[ix % len(dirs)]
+
+    def _get_weather_icon(self, code):
+        if not isinstance(code, int): return "❓";
+        if 200 <= code <= 232: return "⛈️";
+        if 300 <= code <= 321: return "🌧️";
+        if 500 <= code <= 531: return "🌧️";
+        if 600 <= code <= 622: return "❄️";
+        if 701 <= code <= 781: return "🌫️";
+        if code == 800: return "☀️";
+        if code == 801: return "🌤️";
+        if code == 802: return "⛅";
+        if code == 803: return "🌥️";
+        if code == 804: return "☁️";
+        return "❓"
